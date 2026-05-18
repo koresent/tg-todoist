@@ -27,20 +27,22 @@ load_dotenv()
 
 # ================= Configuration =================
 
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TODOIST_API_TOKEN = os.getenv("TODOIST_API_TOKEN")
 USER_TELEGRAM_ID = int(os.getenv("USER_TELEGRAM_ID", 0))
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 POLL_INTERVAL_MINUTES = int(os.getenv("POLL_INTERVAL_MINUTES", 1))
 
-if not all([TELEGRAM_BOT_TOKEN, TODOIST_API_TOKEN, USER_TELEGRAM_ID]):
+tokens_env = os.getenv("TODOIST_API_TOKENS")
+TODOIST_API_TOKENS = [t.strip() for t in tokens_env.split(",") if t.strip()]
+
+if not all([TELEGRAM_BOT_TOKEN, TODOIST_API_TOKENS, USER_TELEGRAM_ID]):
     raise ValueError("Missing required environment variables (Tokens or User ID).")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
-todoist_api = TodoistAPIAsync(TODOIST_API_TOKEN)
+clients = [TodoistAPIAsync(token) for token in TODOIST_API_TOKENS]
 scheduler = AsyncIOScheduler()
+
 dp.message.filter(F.from_user.id == USER_TELEGRAM_ID)
 dp.callback_query.filter(F.from_user.id == USER_TELEGRAM_ID)
 
@@ -66,9 +68,11 @@ class Database:
                 task_id TEXT,
                 run_at TEXT,
                 content TEXT,
-                description TEXT
+                description TEXT,
+                c_idx INTEGER DEFAULT 0
             )
         """)
+
         await self.db.execute(
             "CREATE INDEX IF NOT EXISTS idx_run_at ON snoozed_reminders(run_at)"
         )
@@ -93,18 +97,18 @@ class Database:
         await self.db.commit()
 
     async def add_snooze(
-        self, task_id: str, run_at: datetime, content: str, description: str
+        self, task_id: str, run_at: datetime, content: str, description: str, c_idx: int
     ):
         await self.db.execute(
-            "INSERT INTO snoozed_reminders (task_id, run_at, content, description) VALUES (?, ?, ?, ?)",
-            (task_id, run_at.isoformat(), content, description),
+            "INSERT INTO snoozed_reminders (task_id, run_at, content, description, c_idx) VALUES (?, ?, ?, ?, ?)",
+            (task_id, run_at.isoformat(), content, description, c_idx),
         )
         await self.db.commit()
 
     async def get_pending_snoozes(self) -> list:
         now = datetime.now(timezone.utc).isoformat()
         async with self.db.execute(
-            "SELECT id, task_id, content, description FROM snoozed_reminders WHERE run_at <= ?",
+            "SELECT id, task_id, content, description, c_idx FROM snoozed_reminders WHERE run_at <= ?",
             (now,),
         ) as cursor:
             return await cursor.fetchall()
@@ -125,6 +129,7 @@ class TaskCallback(CallbackData, prefix="t"):
     action: str
     task_id: str
     val: str = ""
+    c_idx: int = 0
 
 
 class CustomTimeState(StatesGroup):
@@ -148,17 +153,22 @@ def get_main_menu():
     )
 
 
-def get_task_keyboard(task_id: str):
+def get_task_keyboard(task_id: str, c_idx: int):
     builder = InlineKeyboardBuilder()
     for t in ["15m", "30m", "1h", "1d"]:
         builder.button(
-            text=t, callback_data=TaskCallback(action="snooze", task_id=task_id, val=t)
+            text=t,
+            callback_data=TaskCallback(
+                action="snooze", task_id=task_id, val=t, c_idx=c_idx
+            ),
         )
     builder.button(
-        text="Enter time", callback_data=TaskCallback(action="custom", task_id=task_id)
+        text="Enter time",
+        callback_data=TaskCallback(action="custom", task_id=task_id, c_idx=c_idx),
     )
     builder.button(
-        text="Done", callback_data=TaskCallback(action="done", task_id=task_id)
+        text="Done",
+        callback_data=TaskCallback(action="done", task_id=task_id, c_idx=c_idx),
     )
     builder.adjust(4, 2)
     return builder.as_markup()
@@ -174,7 +184,7 @@ def extract_task_data(text: str) -> tuple[str, str]:
 # ================= Core Logic =================
 
 
-async def send_reminder(task_id: str, title: str, description: str = "") -> bool:
+async def send_reminder(task_id: str, title: str, description: str, c_idx: int) -> bool:
     text = f"📢 <b>{html.escape(title)}</b>"
     if description:
         text += f"\n\n{html.escape(description)}"
@@ -183,7 +193,7 @@ async def send_reminder(task_id: str, title: str, description: str = "") -> bool
         await bot.send_message(
             USER_TELEGRAM_ID,
             text,
-            reply_markup=get_task_keyboard(task_id),
+            reply_markup=get_task_keyboard(task_id, c_idx),
             parse_mode="HTML",
         )
         return True
@@ -194,44 +204,45 @@ async def send_reminder(task_id: str, title: str, description: str = "") -> bool
 
 async def check_missed_and_scheduled():
     pending = await db_manager.get_pending_snoozes()
-    for s_id, t_id, content, desc in pending:
-        success = await send_reminder(t_id, content, desc)
+    for s_id, t_id, content, desc, c_idx in pending:
+        success = await send_reminder(t_id, content, desc, c_idx)
         if success:
             await db_manager.remove_snooze(s_id)
 
-    try:
-        iterator = await todoist_api.filter_tasks(query="today | overdue")
+    for c_idx, client in enumerate(clients):
+        try:
+            iterator = await client.filter_tasks(query="today | overdue")
 
-        async for tasks_batch in iterator:
-            for task in tasks_batch:
-                if not task.due or not task.due.date:
-                    continue
+            async for tasks_batch in iterator:
+                for task in tasks_batch:
+                    if not task.due or not task.due.date:
+                        continue
 
-                if not isinstance(task.due.date, datetime):
-                    continue
+                    if not isinstance(task.due.date, datetime):
+                        continue
 
-                due_dt = task.due.date
-                db_due_str = due_dt.isoformat()
+                    due_dt = task.due.date
+                    db_due_str = due_dt.isoformat()
 
-                try:
-                    if due_dt.tzinfo is not None:
-                        now = datetime.now(timezone.utc)
-                    else:
-                        now = datetime.now()
+                    try:
+                        if due_dt.tzinfo is not None:
+                            now = datetime.now(timezone.utc)
+                        else:
+                            now = datetime.now()
 
-                    if due_dt <= now:
-                        if not await db_manager.is_notified(task.id, db_due_str):
-                            success = await send_reminder(
-                                task.id, task.content, task.description
-                            )
-                            if success:
-                                await db_manager.mark_notified(task.id, db_due_str)
-                except Exception as e:
-                    logging.error(f"Error comparing dates for task {task.id}: {e}")
-                    continue
+                        if due_dt <= now:
+                            if not await db_manager.is_notified(task.id, db_due_str):
+                                success = await send_reminder(
+                                    task.id, task.content, task.description, c_idx
+                                )
+                                if success:
+                                    await db_manager.mark_notified(task.id, db_due_str)
+                    except Exception as e:
+                        logging.error(f"Error comparing dates for task {task.id}: {e}")
+                        continue
 
-    except Exception as e:
-        logging.error(f"Todoist poll error: {e}")
+        except Exception as e:
+            logging.error(f"Todoist poll error for client index {c_idx}: {e}")
 
 
 # ================= Handlers =================
@@ -239,13 +250,16 @@ async def check_missed_and_scheduled():
 
 @dp.message(CommandStart())
 async def start(m: Message):
-    await m.answer("System active. Monitoring Todoist...", reply_markup=get_main_menu())
+    await m.answer(
+        "System active. Monitoring Todoist accounts...", reply_markup=get_main_menu()
+    )
 
 
 @dp.callback_query(TaskCallback.filter(F.action == "done"))
 async def task_done(cb: CallbackQuery, callback_data: TaskCallback):
     try:
-        await todoist_api.complete_task(task_id=callback_data.task_id)
+        client = clients[callback_data.c_idx]
+        await client.complete_task(task_id=callback_data.task_id)
 
         new_text = cb.message.html_text.replace("📢 ", "✅ ", 1)
         await cb.message.edit_text(new_text, parse_mode="HTML")
@@ -260,7 +274,9 @@ async def task_snooze(cb: CallbackQuery, callback_data: TaskCallback):
     run_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
     content, desc = extract_task_data(cb.message.text)
-    await db_manager.add_snooze(callback_data.task_id, run_at, content, desc)
+    await db_manager.add_snooze(
+        callback_data.task_id, run_at, content, desc, callback_data.c_idx
+    )
 
     await cb.message.delete()
     await cb.answer(f"Snoozed for {callback_data.val}")
@@ -272,7 +288,12 @@ async def custom_snooze_start(
 ):
     content, desc = extract_task_data(cb.message.text)
 
-    await state.update_data(task_id=callback_data.task_id, content=content, desc=desc)
+    await state.update_data(
+        task_id=callback_data.task_id,
+        content=content,
+        desc=desc,
+        c_idx=callback_data.c_idx,
+    )
     await state.set_state(CustomTimeState.waiting_for_time)
 
     await cb.message.answer("When should I remind you? (e.g. '2h')")
@@ -296,7 +317,7 @@ async def custom_snooze_finish(m: Message, state: FSMContext):
     run_at_utc = parsed_date.astimezone(timezone.utc)
 
     await db_manager.add_snooze(
-        data["task_id"], run_at_utc, data["content"], data["desc"]
+        data["task_id"], run_at_utc, data["content"], data["desc"], data["c_idx"]
     )
     await m.answer(f"Scheduled for {parsed_date.strftime('%d.%m %H:%M')}")
     await state.clear()
@@ -323,7 +344,8 @@ async def on_startup():
 async def on_shutdown():
     scheduler.shutdown()
     await db_manager.close()
-    await todoist_api.close()
+    for client in clients:
+        await client.close()
 
 
 async def main():
